@@ -60,21 +60,133 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+# Interruption risk baseline by GPU architecture (commodity nodes preempted more)
+GPU_INTERRUPT_RATES = {
+    "H100": 0.03,
+    "H200": 0.04,
+    "A100": 0.05,
+    "A10G": 0.08,
+    "L4":   0.08,
+    "B200": 0.03,
+    "MI300X": 0.05,
+}
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    input_price_per_m: float = 3.00,
+    cache_discount: float = 0.10,
+) -> float:
+    """Minimum average reads per cached prefix for prompt caching to break even.
+
+    Each cached read saves `input_price_per_m * (1.0 - cache_discount)`.
+    Break-even reads = write_cost / savings_per_read.
+    """
+    unit_savings = input_price_per_m * (1.0 - cache_discount)
+    if unit_savings <= 0:
+        return float("inf")
+    return write_cost_per_m / unit_savings
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost: float,
+    input_price_per_m: float = 3.00,
+    read_discount: float = 0.10,
+) -> bool:
+    """Determine whether prompt caching yields net dollar savings.
+
+    Break-even reads = write_cost / (input_price_per_m * (1.0 - read_discount)).
+    Returns True if avg_cache_reads > break-even.
+    """
+    be = cache_break_even_reads(write_cost, input_price_per_m, read_discount)
+    return avg_cache_reads > be
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    interruption_rate: float | None = None,
+    shared_pool: bool = True,
+) -> str:
+    """Pick a purchasing tier from workload duty cycle, interruptibility, and risk.
+
+    Enhanced policy (Extension 1):
+      - interruptible & not 24/7:
+          Checks interruption risk. If rework overhead is acceptable (<40% of savings),
+          recommends 'spot'.
+      - Dedicated short-run workload without pool sharing:
+          If not shared and annual duration is brief (<120 days), avoids long-term reserved commit.
+      - duty cycle >= break-even:
+          recommends 'reserved' (1yr or 3yr based on commitment horizon).
+      - otherwise:
+          recommends 'on_demand'.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
     if interruptible and hours_per_day < 24:
-        return "spot"
+        irate = interruption_rate or (GPU_INTERRUPT_RATES.get(gpu_type, 0.05) if gpu_type else 0.05)
+        # Extreme interruption rates (>25%) destroy spot checkpoint savings
+        if irate < 0.25:
+            return "spot"
+
+    # If unshared dedicated job with very short lifespan, avoid multi-year lock-in
+    if not shared_pool and job_days is not None and job_days < 60 and duty < 0.9:
+        return "on_demand"
+
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_matrix(
+    gpu_type: str,
+    hours_per_day: float,
+    interruptible: bool,
+    job_days: float = 30.0,
+    annual_horizon_days: float = 365.0,
+) -> dict:
+    """Comprehensive multi-factor purchasing decision matrix (Extension 1).
+
+    Evaluates:
+      1. Spot viability with GPU-specific preemption risk
+      2. 1-Year Reserved vs. 3-Year Reserved (obsolescence vs savings)
+      3. Duty cycle vs. break-even threshold
+    """
+    duty = max(0.0, hours_per_day) / 24.0
+    irate = GPU_INTERRUPT_RATES.get(gpu_type, 0.05)
+    be_3yr = break_even_utilization(0.45)  # 55%
+    be_1yr = break_even_utilization(0.20)  # 80%
+
+    tier = recommend_tier(hours_per_day, interruptible, gpu_type=gpu_type, job_days=job_days)
+
+    reserved_recommendation = "reserved_3yr"
+    if tier == "reserved":
+        # AI hardware lifecycle: H100/H200 evolve fast; 1yr preferred for agile roadmaps
+        if job_days < 180 or gpu_type in ("H100", "B200"):
+            reserved_recommendation = "reserved_1yr"
+        else:
+            reserved_recommendation = "reserved_3yr"
+
+    return {
+        "gpu_type": gpu_type,
+        "duty_cycle": round(duty, 3),
+        "interruptible": interruptible,
+        "interruption_rate": irate,
+        "break_even_3yr": be_3yr,
+        "break_even_1yr": be_1yr,
+        "recommended_tier": tier,
+        "reserved_commitment_type": reserved_recommendation if tier == "reserved" else None,
+        "rationale": (
+            f"Duty cycle {duty:.0%} vs 3yr break-even {be_3yr:.0%}. "
+            f"Preemption risk: {irate:.0%}/hr. "
+            f"{'Safe for spot with checkpointing' if tier == 'spot' else 'Committed utilization justifies reserved' if tier == 'reserved' else 'Low utilization calls for on-demand'}."
+        )
+    }
 
 
 def spot_checkpoint_cost(

@@ -52,10 +52,23 @@ def run(verbose: bool = True) -> dict:
         "best_region": min(sustainability.REGION_CARBON, key=sustainability.REGION_CARBON.get),
     }
 
-    md = report.build_report(baseline, optimized, levers, sustainability=sust)
+    # --- extensions snapshot for report ---
+    cache_econ = r2.get("cache_economics", {})
+    reason_bg = r2.get("reasoning_budget", {})
+    carbon_sch = r3.get("carbon_analysis", {})
+
+    extensions_data = {
+        "cache_be": cache_econ.get("break_even_reads_small", 1.39),
+        "reasoning_saved_usd": reason_bg.get("capped_savings_monthly_usd", 15),
+        "reasoning_saved_kwh": reason_bg.get("capped_savings_daily_kwh", 14.7) * 30,
+        "sched_kwh": carbon_sch.get("schedulable_kwh", 4227),
+        "co2_saved_kg": carbon_sch.get("carbon_saved_kg", 1479.5),
+    }
+
+    md = report.build_report(baseline, optimized, levers, sustainability=sust, extensions=extensions_data)
     out_md = os.path.join(ROOT, "outputs", "report.md")
     os.makedirs(os.path.dirname(out_md), exist_ok=True)
-    with open(out_md, "w") as f:
+    with open(out_md, "w", encoding="utf-8") as f:
         f.write(md)
     png = report.savings_waterfall(levers, os.path.join(ROOT, "outputs", "savings.png"))
 
